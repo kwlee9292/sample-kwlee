@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>실시간 시세</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#191f28; --sub:#8b95a1; --up:#f04452; --down:#3182f6; --line:#e5e8eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#101113; --card:#1b1d21; --text:#f2f4f6; --sub:#8b95a1; --up:#ff5b67; --down:#4b96ff; --line:#2b2e33; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif; }
+  main { max-width:880px; margin:0 auto; padding:32px 16px; }
+  header { display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:8px; margin-bottom:20px; }
+  h1 { font-size:22px; margin:0; }
+  #status { font-size:13px; color:var(--sub); }
+  #status.err { color:var(--up); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px; padding:20px; transition:background-color .6s; }
+  .card .name { font-size:15px; font-weight:600; }
+  .card .code { font-size:12px; color:var(--sub); margin-left:4px; font-weight:400; }
+  .card .price { font-size:28px; font-weight:700; margin:12px 0 4px; font-variant-numeric:tabular-nums; }
+  .card .chg { font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .up { color:var(--up); } .down { color:var(--down); } .flat { color:var(--sub); }
+  .flash-up { background:color-mix(in srgb, var(--up) 14%, var(--card)); }
+  .flash-down { background:color-mix(in srgb, var(--down) 14%, var(--card)); }
+  footer { margin-top:20px; font-size:12px; color:var(--sub); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>실시간 시세</h1>
+    <span id="status">불러오는 중…</span>
+  </header>
+  <div class="grid" id="grid"></div>
+  <footer>데이터: 네이버 증권 · 5초마다 갱신 · 투자 판단의 근거로 사용하지 마세요.</footer>
+</main>
+<script>
+const ORDER = ['KOSPI', 'KOSDAQ', '005930', '000660'];
+const INTERVAL = 5000;
+const last = {};
+const fmt = (n, d) => n == null ? '-' : n.toLocaleString('ko-KR', { minimumFractionDigits: d, maximumFractionDigits: d });
+
+function cls(q) {
+  if (/RISING|UPPER/.test(q.direction) || q.change > 0) return 'up';
+  if (/FALLING|LOWER/.test(q.direction) || q.change < 0) return 'down';
+  return 'flat';
+}
+
+function render(quotes) {
+  const grid = document.getElementById('grid');
+  quotes.sort((a, b) => ORDER.indexOf(a.code) - ORDER.indexOf(b.code));
+  for (const q of quotes) {
+    let card = document.getElementById('c-' + q.code);
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'card';
+      card.id = 'c-' + q.code;
+      card.innerHTML = '<div class="name"></div><div class="price"></div><div class="chg"></div>';
+      grid.appendChild(card);
+    }
+    const d = q.type === 'index' ? 2 : 0;
+    const c = cls(q);
+    const arrow = c === 'up' ? '▲' : c === 'down' ? '▼' : '';
+    card.querySelector('.name').innerHTML = `${q.name}<span class="code">${q.type === 'stock' ? q.code : ''}</span>`;
+    card.querySelector('.price').textContent = fmt(q.price, d);
+    const chg = card.querySelector('.chg');
+    chg.className = 'chg ' + c;
+    chg.textContent = `${arrow} ${fmt(Math.abs(q.change), d)} (${q.rate > 0 ? '+' : ''}${fmt(q.rate, 2)}%)`;
+
+    const prev = last[q.code];
+    if (prev != null && prev !== q.price) {
+      card.classList.add(q.price > prev ? 'flash-up' : 'flash-down');
+      setTimeout(() => card.classList.remove('flash-up', 'flash-down'), 600);
+    }
+    last[q.code] = q.price;
+  }
+}
+
+async function tick() {
+  const status = document.getElementById('status');
+  try {
+    const res = await fetch('/api/quotes', { cache: 'no-store' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || res.status);
+    render(data.quotes);
+    const market = data.quotes[0] && data.quotes[0].marketStatus;
+    const label = { OPEN: '장중', CLOSE: '장 마감', PREOPEN: '장 시작 전', MOCK: '테스트 데이터' }[market] || market || '';
+    status.className = '';
+    status.textContent = `${label} · ${new Date(data.updatedAt).toLocaleTimeString('ko-KR')} 기준`;
+  } catch (e) {
+    status.className = 'err';
+    status.textContent = '불러오기 실패: ' + e.message;
+  } finally {
+    setTimeout(tick, INTERVAL);
+  }
+}
+tick();
+</script>
+</body>
+</html>
