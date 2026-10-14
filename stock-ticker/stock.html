@@ -79,17 +79,60 @@ function render(quotes) {
   }
 }
 
-// 서버 없이 더블클릭으로 열 수 있도록, 무료 공개 CORS 프록시를 거쳐 네이버 증권 API를 호출한다.
-// 프록시 하나가 막히면 다음 것을 시도한다.
+// 서버 없이 더블클릭으로 열 수 있도록 두 가지 방법을 순서대로 시도한다.
+// 1) 네이버 구 폴링 API의 JSONP(<script> 태그로 불러오므로 CORS에 막히지 않음)
+// 2) 무료 공개 CORS 프록시를 거친 신 폴링 API
 const NAVER = 'https://polling.finance.naver.com/api/realtime/domestic';
 const URLS = [`${NAVER}/stock/005930,000660`, `${NAVER}/index/KOSPI`, `${NAVER}/index/KOSDAQ`];
+const NAMES = { '005930': '삼성전자', '000660': 'SK하이닉스', KOSPI: '코스피', KOSDAQ: '코스닥' };
 const PROXIES = [
   (u) => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
   (u) => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
   (u) => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u),
 ];
 let proxyIdx = 0;
+let method = 'jsonp';
 const num = (v) => (v == null ? null : Number(String(v).replace(/,/g, '')));
+const RF = { 1: 'UPPER_LIMIT', 2: 'RISING', 3: 'EVEN', 4: 'LOWER_LIMIT', 5: 'FALLING' };
+
+function jsonp(url) {
+  return new Promise((resolve, reject) => {
+    const cb = '__cb' + Date.now() + Math.floor(Math.random() * 1e6);
+    const s = document.createElement('script');
+    const done = () => { delete window[cb]; s.remove(); clearTimeout(t); };
+    const t = setTimeout(() => { done(); reject(new Error('JSONP 시간 초과')); }, 5000);
+    window[cb] = (data) => { done(); resolve(data); };
+    s.onerror = () => { done(); reject(new Error('JSONP 로드 실패')); };
+    s.charset = 'euc-kr';
+    s.src = url + (url.includes('?') ? '&' : '?') + '_callback=' + cb + '&_=' + Date.now();
+    document.head.appendChild(s);
+  });
+}
+
+async function viaJsonp() {
+  const q = 'SERVICE_ITEM:005930,000660|SERVICE_INDEX:KOSPI,KOSDAQ';
+  const r = await jsonp('https://polling.finance.naver.com/api/realtime.nhn?query=' + encodeURIComponent(q));
+  const areas = (r.result && r.result.areas) || [];
+  const quotes = areas.flatMap((area) => (area.datas || []).map((d) => {
+    const isIndex = area.name === 'SERVICE_INDEX';
+    // 지수는 100배 정수로 내려온다 (예: 258012 → 2580.12)
+    const scale = isIndex && Math.abs(d.nv) > 20000 ? 100 : 1;
+    const dir = RF[d.rf];
+    const sign = /FALLING|LOWER/.test(dir) ? -1 : 1;
+    return {
+      type: isIndex ? 'index' : 'stock',
+      code: d.cd,
+      name: NAMES[d.cd] || d.nm,
+      price: d.nv / scale,
+      change: sign * Math.abs(d.cv) / scale,
+      rate: sign * Math.abs(d.cr),
+      direction: dir,
+      marketStatus: d.ms,
+    };
+  }));
+  if (!quotes.length) throw new Error('JSONP 데이터 없음');
+  return quotes;
+}
 
 async function getJson(u) {
   for (let i = 0; i < PROXIES.length; i++) {
@@ -102,29 +145,44 @@ async function getJson(u) {
       return json;
     } catch (e) { /* 다음 프록시 시도 */ }
   }
-  throw new Error('모든 프록시 접속 실패');
+  throw new Error('프록시 접속 실패');
+}
+
+async function viaProxy() {
+  const results = await Promise.all(URLS.map(getJson));
+  const quotes = results.flatMap((r, i) => (r.datas || []).map((d) => ({
+    type: i === 0 ? 'stock' : 'index',
+    code: d.itemCode,
+    name: NAMES[d.itemCode] || d.stockName,
+    price: num(d.closePrice),
+    change: num(d.compareToPreviousClosePrice),
+    rate: num(d.fluctuationsRatio),
+    direction: d.compareToPreviousPrice && d.compareToPreviousPrice.name,
+    marketStatus: d.marketStatus,
+  })));
+  if (!quotes.length) throw new Error('프록시 데이터 없음');
+  return quotes;
+}
+
+async function load() {
+  const order = method === 'jsonp' ? [['jsonp', viaJsonp], ['proxy', viaProxy]] : [['proxy', viaProxy], ['jsonp', viaJsonp]];
+  const errors = [];
+  for (const [name, fn] of order) {
+    try { const q = await fn(); method = name; return q; }
+    catch (e) { errors.push(e.message); }
+  }
+  throw new Error(errors.join(' / '));
 }
 
 async function tick() {
   const status = document.getElementById('status');
   try {
-    const results = await Promise.all(URLS.map(getJson));
-    const quotes = results.flatMap((r, i) => (r.datas || []).map((d) => ({
-      type: i === 0 ? 'stock' : 'index',
-      code: d.itemCode,
-      name: d.stockName,
-      price: num(d.closePrice),
-      change: num(d.compareToPreviousClosePrice),
-      rate: num(d.fluctuationsRatio),
-      direction: d.compareToPreviousPrice && d.compareToPreviousPrice.name,
-      marketStatus: d.marketStatus,
-    })));
-    if (!quotes.length) throw new Error('데이터 없음');
+    const quotes = await load();
     render(quotes);
     const market = quotes[0].marketStatus;
-    const label = { OPEN: '장중', CLOSE: '장 마감', PREOPEN: '장 시작 전' }[market] || market || '';
+    const label = { OPEN: '장중', CLOSE: '장 마감', PREOPEN: '장 시작 전', CLOSED: '장 마감' }[market] || market || '';
     status.className = '';
-    status.textContent = `${label} · ${new Date().toLocaleTimeString('ko-KR')} 기준`;
+    status.textContent = `${label} · ${new Date().toLocaleTimeString('ko-KR')} 기준 (${method === 'jsonp' ? '직접' : '프록시'})`;
   } catch (e) {
     status.className = 'err';
     status.textContent = '불러오기 실패: ' + e.message;
